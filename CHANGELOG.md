@@ -35,6 +35,17 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   “leave blank to keep” semantics.
 - **Mount blocked the menu-bar UI.** Port wait and NetFS mount now run
   off the main actor via `async` mount + `Task.detached`.
+- **Unmount during in-flight mount.** A concurrent Unmount while NetFS
+  was connecting could leave an orphan `rclone serve` and then commit
+  the mount anyway. Mounts now publish the process early, use a
+  generation token cancelled by Unmount, and discard results if the
+  user already unmounted.
+- **Health poll only checked TCP.** rclone could still accept localhost
+  connections while SFTP was dead. Poll now does an authenticated
+  WebDAV PROPFIND (off the main actor) so backend failures trigger
+  recovery.
+- **Stale `/Volumes/<name>` before remount.** Mid-session remount now
+  reuses `reconcileStaleMount` so NetFS does not stack `VPSFix-1`.
 
 ### Changed
 

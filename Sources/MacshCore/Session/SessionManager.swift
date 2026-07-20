@@ -197,17 +197,18 @@ public final class SessionManager: ObservableObject {
         }
         stopHealthPoll(remoteID: remoteID)
 
-        if case .mounted = session.status {
+        if case .mounted = session.status, session.rcloneProcess?.isRunning == true {
             return
         }
 
+        // Invalidate any other in-flight mount for this remote (e.g. overlapping retries).
+        session.mountGeneration &+= 1
+        let generation = session.mountGeneration
         session.wantsMounted = true
         session.transition(to: .starting)
 
         let remote = session.remote
         var ephemeralKeyURL: URL? = nil
-        var spawnedProcess: Process? = nil
-        var configDirURL: URL? = nil
         var envOverrides: [String: String] = [:]
         var bundle = BackendSecrets()
         var remotePath: String
@@ -269,6 +270,11 @@ public final class SessionManager: ObservableObject {
                 remotePath = ftp.remotePath
             }
 
+            try Task.checkCancellation()
+            guard session.mountGeneration == generation, session.wantsMounted else {
+                throw CancellationError()
+            }
+
             let configText = try RcloneConfigBuilder.build(
                 remote: remote,
                 secrets: bundle,
@@ -277,6 +283,9 @@ public final class SessionManager: ObservableObject {
             let logURL = logsDir.appendingPathComponent("\(remote.id.uuidString).log")
             let runner = RcloneProcess(binary: rcloneBinary, logFile: logURL)
             let volname = mounter.volumeName(from: remote.name)
+            // Drop any leftover volume from a previous dead session before NetFS auto-numbers VPSFix-1.
+            mounter.reconcileStaleMount(volumeName: volname)
+
             let spawned: RcloneProcess.Spawned
             switch remote.mountProtocol {
             case .webdav:
@@ -297,8 +306,21 @@ public final class SessionManager: ObservableObject {
                     envOverrides: envOverrides
                 )
             }
-            spawnedProcess = spawned.process
-            configDirURL = spawned.configDirURL
+
+            // Publish process early so Unmount during NetFS can kill the orphan serve.
+            session.rcloneProcess = spawned.process
+            session.servePort = spawned.port
+            session.webDAVUser = spawned.user
+            session.webDAVPassword = spawned.password
+            session.configDirURL = spawned.configDirURL
+            session.ephemeralKeyURL = ephemeralKeyURL
+            attachTerminationHandler(remoteID: remoteID, process: spawned.process)
+
+            guard session.mountGeneration == generation, session.wantsMounted else {
+                teardownBackend(session: session, unmountVolume: false)
+                session.transition(to: .idle)
+                return
+            }
 
             // Blocking port wait + NetFS off the main actor so the menu stays responsive.
             let port = spawned.port
@@ -306,50 +328,65 @@ public final class SessionManager: ObservableObject {
             let password = spawned.password
             let mountProtocol = remote.mountProtocol
             let remoteName = remote.name
-            let mountpoint: String = try await Task.detached(priority: .userInitiated) { [mounter] in
-                try Self.waitForPort(port, timeout: 5.0)
-                switch mountProtocol {
-                case .webdav:
-                    return try mounter.mountWebDAV(
-                        host: "127.0.0.1",
-                        port: port,
-                        baseurl: "/\(volname)",
-                        user: user,
-                        password: password
-                    )
-                case .nfs:
-                    let mp = try mounter.resolveMountpoint(name: remoteName)
-                    try mounter.mountNFS(host: "127.0.0.1", port: port, exportPath: "/", name: remoteName, mountpoint: mp)
-                    return mp
+            let mountpoint: String
+            do {
+                mountpoint = try await Task.detached(priority: .userInitiated) { [mounter] in
+                    try Self.waitForPort(port, timeout: 5.0)
+                    switch mountProtocol {
+                    case .webdav:
+                        return try mounter.mountWebDAV(
+                            host: "127.0.0.1",
+                            port: port,
+                            baseurl: "/\(volname)",
+                            user: user,
+                            password: password
+                        )
+                    case .nfs:
+                        let mp = try mounter.resolveMountpoint(name: remoteName)
+                        try mounter.mountNFS(host: "127.0.0.1", port: port, exportPath: "/", name: remoteName, mountpoint: mp)
+                        return mp
+                    }
+                }.value
+            } catch {
+                // Unmount may have killed rclone mid-await.
+                guard session.mountGeneration == generation, session.wantsMounted else {
+                    teardownBackend(session: session, unmountVolume: true)
+                    session.transition(to: .idle)
+                    return
                 }
-            }.value
+                throw error
+            }
 
-            session.rcloneProcess = spawned.process
+            guard session.mountGeneration == generation, session.wantsMounted else {
+                // User unmounted while NetFS was connecting — drop the volume we just attached.
+                try? mounter.unmount(mountpoint: mountpoint)
+                teardownBackend(session: session, unmountVolume: false)
+                session.transition(to: .idle)
+                return
+            }
+
             session.mountpoint = mountpoint
-            session.servePort = spawned.port
-            session.configDirURL = spawned.configDirURL
-            session.ephemeralKeyURL = ephemeralKeyURL
             session.wantsMounted = true
             session.transition(to: .mounted(at: mountpoint))
-
-            attachTerminationHandler(remoteID: remoteID, process: spawned.process)
             startHealthPoll(remoteID: remoteID)
+        } catch is CancellationError {
+            teardownBackend(session: session, unmountVolume: true)
+            if session.wantsMounted {
+                session.transition(to: .failed(reason: "cancelled"))
+            } else {
+                session.transition(to: .idle)
+            }
         } catch {
-            // P0-4: always kill rclone if spawn already succeeded.
-            // Clear handler first so a late termination callback cannot start a remount.
-            if let proc = spawnedProcess {
-                proc.terminationHandler = nil
-                if proc.isRunning { proc.terminate() }
+            // P0-4: always kill rclone if spawn already succeeded / published on session.
+            teardownBackend(session: session, unmountVolume: true)
+            if let url = ephemeralKeyURL {
+                try? FileManager.default.removeItem(at: url)
+                session.ephemeralKeyURL = nil
             }
-            if let dir = configDirURL {
-                try? FileManager.default.removeItem(at: dir)
+            if !session.wantsMounted {
+                session.transition(to: .idle)
+                return
             }
-            if let url = ephemeralKeyURL { try? FileManager.default.removeItem(at: url) }
-            session.rcloneProcess = nil
-            session.mountpoint = nil
-            session.servePort = nil
-            session.configDirURL = nil
-            session.ephemeralKeyURL = nil
             session.transition(to: .failed(reason: String(describing: error)))
             throw error
         }
@@ -358,6 +395,8 @@ public final class SessionManager: ObservableObject {
     public func unmount(remoteID: UUID) throws {
         guard let session = sessions.first(where: { $0.id == remoteID }) else { return }
         session.wantsMounted = false
+        // Invalidate in-flight mount() so it will not commit after NetFS returns.
+        session.mountGeneration &+= 1
         retryTasks[remoteID]?.cancel()
         retryTasks[remoteID] = nil
         stopHealthPoll(remoteID: remoteID)
@@ -407,7 +446,32 @@ public final class SessionManager: ObservableObject {
                 guard !Task.isCancelled, let self else { return }
                 guard let session = self.sessions.first(where: { $0.id == remoteID }) else { return }
                 guard case .mounted = session.status else { return }
-                if self.isHealthy(session) {
+
+                // Snapshot values and probe off the main actor (PROPFIND can block ~3s).
+                let procRunning = session.rcloneProcess?.isRunning == true
+                let port = session.servePort
+                let mountpoint = session.mountpoint
+                let isWebDAV = session.remote.mountProtocol == .webdav
+                let vol = self.mounter.volumeName(from: session.remote.name)
+                let user = session.webDAVUser
+                let pass = session.webDAVPassword
+
+                let healthy = await Task.detached(priority: .utility) {
+                    Self.probeHealth(
+                        processRunning: procRunning,
+                        port: port,
+                        mountpoint: mountpoint,
+                        webDAV: isWebDAV,
+                        volumeName: vol,
+                        webDAVUser: user,
+                        webDAVPassword: pass
+                    )
+                }.value
+
+                guard !Task.isCancelled else { return }
+                guard case .mounted = session.status else { return }
+
+                if healthy {
                     self.healthFailStreak[remoteID] = 0
                 } else {
                     let streak = (self.healthFailStreak[remoteID] ?? 0) + 1
@@ -426,12 +490,24 @@ public final class SessionManager: ObservableObject {
         healthTasks[remoteID] = nil
     }
 
-    private func isHealthy(_ session: RemoteSession) -> Bool {
-        guard let proc = session.rcloneProcess, proc.isRunning else { return false }
-        guard let port = session.servePort else { return false }
-        if !Self.tcpConnects(host: "127.0.0.1", port: port) { return false }
-        if let mp = session.mountpoint {
-            // Volume must still be present; if Finder already ejected it, recover.
+    nonisolated private static func probeHealth(
+        processRunning: Bool,
+        port: Int?,
+        mountpoint: String?,
+        webDAV: Bool,
+        volumeName: String,
+        webDAVUser: String?,
+        webDAVPassword: String?
+    ) -> Bool {
+        guard processRunning else { return false }
+        guard let port else { return false }
+        if !tcpConnects(host: "127.0.0.1", port: port) { return false }
+        if webDAV, let user = webDAVUser, let pass = webDAVPassword {
+            if !webDAVRootReachable(port: port, baseurl: "/\(volumeName)", user: user, password: pass) {
+                return false
+            }
+        }
+        if let mp = mountpoint {
             var isDir: ObjCBool = false
             if !FileManager.default.fileExists(atPath: mp, isDirectory: &isDir) {
                 return false
@@ -489,6 +565,8 @@ public final class SessionManager: ObservableObject {
         session.rcloneProcess = nil
         session.mountpoint = nil
         session.servePort = nil
+        session.webDAVUser = nil
+        session.webDAVPassword = nil
         session.configDirURL = nil
         session.ephemeralKeyURL = nil
     }
@@ -533,5 +611,42 @@ public final class SessionManager: ObservableObject {
         var len = socklen_t(MemoryLayout<Int32>.size)
         getsockopt(sock, SOL_SOCKET, SO_ERROR, &soError, &len)
         return soError == 0
+    }
+
+    /// Authenticated Depth:0 PROPFIND against local rclone WebDAV. Returns false on
+    /// timeout / connection failure / HTTP 5xx (backend often broken when SFTP is down).
+    nonisolated private static func webDAVRootReachable(
+        port: Int,
+        baseurl: String,
+        user: String,
+        password: String
+    ) -> Bool {
+        let path = baseurl.hasSuffix("/") ? baseurl : baseurl + "/"
+        guard let url = URL(string: "http://127.0.0.1:\(port)\(path)") else { return false }
+        var request = URLRequest(url: url, timeoutInterval: 3)
+        request.httpMethod = "PROPFIND"
+        request.setValue("0", forHTTPHeaderField: "Depth")
+        request.setValue("text/xml", forHTTPHeaderField: "Content-Type")
+        let token = Data("\(user):\(password)".utf8).base64EncodedString()
+        request.setValue("Basic \(token)", forHTTPHeaderField: "Authorization")
+        request.httpBody = Data("""
+            <?xml version="1.0" encoding="utf-8"?>
+            <propfind xmlns="DAV:"><prop><resourcetype/></prop></propfind>
+            """.utf8)
+
+        let sem = DispatchSemaphore(value: 0)
+        var ok = false
+        let task = URLSession.shared.dataTask(with: request) { _, response, error in
+            defer { sem.signal() }
+            guard error == nil, let http = response as? HTTPURLResponse else { return }
+            // 207 Multi-Status is success. 5xx usually means the remote backend failed.
+            ok = (200..<500).contains(http.statusCode)
+        }
+        task.resume()
+        if sem.wait(timeout: .now() + 3.5) == .timedOut {
+            task.cancel()
+            return false
+        }
+        return ok
     }
 }
