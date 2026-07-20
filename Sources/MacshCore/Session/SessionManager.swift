@@ -16,8 +16,6 @@ public final class SessionManager: ObservableObject {
     private var retryTasks: [UUID: Task<Void, Never>] = [:]
     private var healthTasks: [UUID: Task<Void, Never>] = [:]
     private var sessionCancellables: [UUID: AnyCancellable] = [:]
-    /// Suppresses terminationHandler while we intentionally stop rclone.
-    private var intentionalStops: Set<UUID> = []
     /// Consecutive health-poll failures per remote before declaring death.
     private var healthFailStreak: [UUID: Int] = [:]
 
@@ -338,10 +336,10 @@ public final class SessionManager: ObservableObject {
             startHealthPoll(remoteID: remoteID)
         } catch {
             // P0-4: always kill rclone if spawn already succeeded.
-            if let proc = spawnedProcess, proc.isRunning {
-                intentionalStops.insert(remoteID)
-                proc.terminate()
-                intentionalStops.remove(remoteID)
+            // Clear handler first so a late termination callback cannot start a remount.
+            if let proc = spawnedProcess {
+                proc.terminationHandler = nil
+                if proc.isRunning { proc.terminate() }
             }
             if let dir = configDirURL {
                 try? FileManager.default.removeItem(at: dir)
@@ -394,7 +392,7 @@ public final class SessionManager: ObservableObject {
         process.terminationHandler = { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                if self.intentionalStops.contains(remoteID) { return }
+                // Intentional stops nil the handler before terminate(); any fire here is unexpected death.
                 self.handleBackendDeath(remoteID: remoteID, reason: "rclone exited")
             }
         }
@@ -444,13 +442,16 @@ public final class SessionManager: ObservableObject {
 
     private func handleBackendDeath(remoteID: UUID, reason: String) {
         guard let session = sessions.first(where: { $0.id == remoteID }) else { return }
-        // Ignore if already recovering or idle after user unmount.
+        // Ignore after user unmount, or when a remount is already in flight without a live process.
         switch session.status {
         case .idle:
             return
-        case .reconnecting:
-            // Already scheduling; still tear down leftovers once.
-            break
+        case .reconnecting where session.rcloneProcess == nil:
+            // scheduleMount already owns recovery; avoid stacked scheduleMount calls.
+            return
+        case .starting where session.rcloneProcess == nil:
+            // Mount attempt still running; let its catch path handle failure.
+            return
         default:
             break
         }
@@ -463,22 +464,21 @@ public final class SessionManager: ObservableObject {
             session.transition(to: .reconnecting(attempt: 0, reason: reason))
             scheduleMount(remoteID: remoteID, attempt: 0)
         } else {
+            // Explicit unmount already transitions to .idle; only use .failed for unexpected death.
             session.transition(to: .failed(reason: reason))
         }
     }
 
     private func teardownBackend(session: RemoteSession, unmountVolume: Bool) {
-        let id = session.id
         if unmountVolume, let mp = session.mountpoint {
             try? mounter.unmount(mountpoint: mp)
         }
         if let proc = session.rcloneProcess {
-            if proc.isRunning {
-                intentionalStops.insert(id)
-                proc.terminate()
-                intentionalStops.remove(id)
-            }
+            // Detach handler before SIGTERM so intentional stops do not re-enter handleBackendDeath.
             proc.terminationHandler = nil
+            if proc.isRunning {
+                proc.terminate()
+            }
         }
         if let dir = session.configDirURL {
             try? FileManager.default.removeItem(at: dir)
