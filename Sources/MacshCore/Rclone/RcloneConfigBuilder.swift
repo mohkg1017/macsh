@@ -58,7 +58,8 @@ public enum RcloneConfigBuilder {
 
     /// Returns the rclone config file text. Sensitive credentials are passed via env at runtime
     /// (RCLONE_CONFIG_R_PASS for SFTP/FTP password, RCLONE_CONFIG_R_SECRET_ACCESS_KEY
-    /// for S3 secret), so the on-disk config never contains plaintext or obscured secrets.
+    /// for S3 secret, RCLONE_CONFIG_R_KEY_FILE_PASS for encrypted key passphrase),
+    /// so the on-disk config never contains plaintext or obscured secrets.
     public static func build(remote: Remote, secrets: BackendSecrets, knownHostsPath: String? = nil) throws -> String {
         var lines: [String] = ["[\(sectionName)]"]
         switch remote.backend {
@@ -68,6 +69,8 @@ public enum RcloneConfigBuilder {
             lines.append("host = \(cfg.host)")
             lines.append("port = \(cfg.port)")
             lines.append("user = \(cfg.user)")
+            // Prefer failing fast on flaky links (e.g. Tailscale) over hanging Finder.
+            lines.append("idle_timeout = 1m")
             switch cfg.authKind {
             case .password:
                 guard s.password != nil else { throw RcloneConfigError.passwordAuthRequiresPassword }
@@ -113,6 +116,11 @@ public enum RcloneConfigBuilder {
     /// See: https://rclone.org/docs/#config-file
     public static func passwordEnvVar(remoteID: UUID) -> String {
         "RCLONE_CONFIG_\(sectionName.uppercased())_PASS"
+    }
+
+    /// Env var for SFTP encrypted private key passphrase (`key_file_pass`).
+    public static func keyFilePassEnvVar(remoteID: UUID) -> String {
+        "RCLONE_CONFIG_\(sectionName.uppercased())_KEY_FILE_PASS"
     }
 
     /// Env var name for S3 secret access key.

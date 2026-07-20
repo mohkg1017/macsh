@@ -2,7 +2,8 @@ import Foundation
 import Darwin
 import NetFS
 
-public final class Mounter {
+/// Stateless mount helpers; safe to call from background queues.
+public final class Mounter: @unchecked Sendable {
     public enum MountError: LocalizedError {
         case mountpointCreationFailed(String)
         case mountFailed(stderr: String, exitCode: Int32)

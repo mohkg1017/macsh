@@ -44,4 +44,32 @@ final class RcloneConfigBuilderTests: XCTestCase {
             sftpSecrets: SFTPSecrets(password: nil, privateKeyPath: nil, keyPassphrase: nil)
         ))
     }
+
+    func testSFTPIncludesIdleTimeout() throws {
+        let r = Remote(
+            id: UUID(),
+            name: "h",
+            backend: .sftp(SFTPConfig(host: "h", port: 22, user: "u", remotePath: "/", authKind: .password)),
+            mountProtocol: .webdav, autoMount: false
+        )
+        let cfg = try RcloneConfigBuilder.build(
+            remote: r,
+            sftpSecrets: SFTPSecrets(password: "x", privateKeyPath: nil, keyPassphrase: nil)
+        )
+        XCTAssertTrue(cfg.contains("idle_timeout = 1m"))
+    }
+
+    func testKeyFilePassEnvVarName() {
+        let name = RcloneConfigBuilder.keyFilePassEnvVar(remoteID: UUID())
+        XCTAssertEqual(name, "RCLONE_CONFIG_R_KEY_FILE_PASS")
+    }
+
+    func testBackoffDelaySchedule() {
+        XCTAssertEqual(SessionManager.backoffDelay(attempt: 1), 1)
+        XCTAssertEqual(SessionManager.backoffDelay(attempt: 2), 5)
+        XCTAssertEqual(SessionManager.backoffDelay(attempt: 3), 30)
+        XCTAssertEqual(SessionManager.backoffDelay(attempt: 4), 300)
+        XCTAssertEqual(SessionManager.backoffDelay(attempt: 99), 300)
+        XCTAssertEqual(SessionManager.backoffDelay(attempt: 0), 0)
+    }
 }

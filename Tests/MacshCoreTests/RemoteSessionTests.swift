@@ -26,6 +26,17 @@ final class RemoteSessionTests: XCTestCase {
         XCTAssertEqual(session.status, .failed(reason: "boom"))
     }
 
+    func testTransitionToReconnecting() {
+        let session = RemoteSession(remote: makeRemote())
+        session.transition(to: .reconnecting(attempt: 2, reason: "rclone exited"))
+        XCTAssertEqual(session.status, .reconnecting(attempt: 2, reason: "rclone exited"))
+    }
+
+    func testWantsMountedDefaultFalse() {
+        let session = RemoteSession(remote: makeRemote())
+        XCTAssertFalse(session.wantsMounted)
+    }
+
     private func makeRemote() -> Remote {
         Remote(
             id: UUID(),

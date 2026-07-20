@@ -4,6 +4,45 @@ All notable changes to macsh are documented here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versioning
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] — 2026-07-20
+
+### Fixed
+
+- **Mid-session death recovery (Finder “couldn't connect to the server”
+  spam).** After a successful mount, macsh never noticed when `rclone`
+  exited or the local WebDAV endpoint went dead, so Finder kept hitting a
+  zombie `/Volumes/<name>` volume. Mounted sessions now:
+  - attach a `Process.terminationHandler` to the rclone child
+  - health-poll every ~20s (process alive, localhost port open, mount path
+    present) with 2 consecutive failures required before recovery
+  - force-unmount the volume, clean temp config/key files, and silently
+    remount with the existing exponential backoff when the user still
+    wants the volume up (`wantsMounted`)
+  - show `↻` in the menu bar while reconnecting; explicit Unmount clears
+    `wantsMounted` so recovery stops
+- **Orphan rclone on failed mount.** If `rclone serve` started but
+  NetFS/`waitForPort` failed, the child process was never terminated
+  (it was only stored on the session after a full success). Catch path
+  now always kills a spawned process and deletes its temp config dir.
+- **Temp `macsh-rclone-*` config dirs leaked** for the life of the
+  process; they are now tracked on the session and removed on unmount,
+  death, or failed mount.
+- **Encrypted SFTP key passphrase ignored.** Passphrase was stored in
+  Keychain but never passed to rclone (`key_file_pass` via
+  `RCLONE_CONFIG_R_KEY_FILE_PASS`).
+- **Edit remote: key-file path always required.** Blank path is now
+  allowed when editing (keep existing Keychain path), matching password
+  “leave blank to keep” semantics.
+- **Mount blocked the menu-bar UI.** Port wait and NetFS mount now run
+  off the main actor via `async` mount + `Task.detached`.
+
+### Changed
+
+- SFTP config includes `idle_timeout = 1m` so stale Tailscale/SFTP pools
+  refresh more predictably.
+- “Check for updates…” reads `MacshUpdateGitHubRepo` from Info.plist
+  (default `mohkg1017/macsh` on this fork).
+
 ## [0.1.1] — 2026-05-04
 
 ### Fixed
@@ -64,5 +103,6 @@ Initial public release.
   `xattr -dr com.apple.quarantine /Applications/macsh.app` to clear
   Gatekeeper. Notarized signing is a planned follow-up.
 
+[0.1.3]: https://github.com/mohkg1017/macsh/releases/tag/v0.1.3
 [0.1.1]: https://github.com/AyonPal/macsh/releases/tag/v0.1.1
 [0.1.0]: https://github.com/AyonPal/macsh/releases/tag/v0.1.0

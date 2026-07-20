@@ -89,8 +89,12 @@ final class MenuBarController {
     }
 
     private func isMounted(_ session: RemoteSession) -> Bool {
-        if case .mounted = session.status { return true }
-        return false
+        switch session.status {
+        case .mounted, .starting, .reconnecting:
+            return true
+        default:
+            return false
+        }
     }
 
     private func title(for session: RemoteSession) -> String {
@@ -99,6 +103,7 @@ final class MenuBarController {
         case .idle: dot = "○"
         case .starting: dot = "◐"
         case .mounted: dot = "●"
+        case .reconnecting: dot = "↻"
         case .failed: dot = "✕"
         }
         return "\(dot) \(session.remote.name)"
@@ -110,10 +115,13 @@ final class MenuBarController {
         Task { @MainActor in
             do {
                 switch session.status {
-                case .mounted: try manager.unmount(remoteID: id)
-                default: try manager.mount(remoteID: id)
+                case .mounted, .starting, .reconnecting:
+                    try manager.unmount(remoteID: id)
+                default:
+                    try await manager.mount(remoteID: id)
                 }
             } catch {
+                // Only surface errors from explicit user Mount (not silent remount).
                 NSAlert(error: error).runModal()
             }
         }
@@ -212,7 +220,10 @@ final class MenuBarController {
 
     @objc private func checkForUpdates() {
         let current = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
-        let url = URL(string: "https://api.github.com/repos/AyonPal/macsh/releases/latest")!
+        // Prefer this build's configured feed (forks), fall back to upstream.
+        let ownerRepo = Bundle.main.object(forInfoDictionaryKey: "MacshUpdateGitHubRepo") as? String
+            ?? "mohkg1017/macsh"
+        let url = URL(string: "https://api.github.com/repos/\(ownerRepo)/releases/latest")!
         var req = URLRequest(url: url)
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         URLSession.shared.dataTask(with: req) { data, _, error in
@@ -229,7 +240,7 @@ final class MenuBarController {
                 }
                 let latest = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
                 let pageURL = (json["html_url"] as? String).flatMap(URL.init(string:))
-                    ?? URL(string: "https://github.com/AyonPal/macsh/releases/latest")!
+                    ?? URL(string: "https://github.com/\(ownerRepo)/releases/latest")!
                 if Self.compareVersions(current, latest) < 0 {
                     let alert = NSAlert()
                     alert.messageText = "Update available"

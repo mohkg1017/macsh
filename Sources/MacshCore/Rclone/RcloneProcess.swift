@@ -7,6 +7,8 @@ public final class RcloneProcess {
         public let port: Int
         public let user: String
         public let password: String
+        /// Directory containing the temporary rclone.conf for this serve process.
+        public let configDirURL: URL
     }
 
     public enum SpawnError: Error {
@@ -118,7 +120,13 @@ public final class RcloneProcess {
         do { try process.run() }
         catch { throw SpawnError.launchFailed(error) }
 
-        return Spawned(process: process, port: port, user: user, password: password)
+        return Spawned(
+            process: process,
+            port: port,
+            user: user,
+            password: password,
+            configDirURL: tmpDir
+        )
     }
 
     /// Runs `rclone obscure <plaintext>` and returns the obscured form. rclone's env-var

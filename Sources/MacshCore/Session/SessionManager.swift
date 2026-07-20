@@ -14,7 +14,15 @@ public final class SessionManager: ObservableObject {
     private let hostKeyVerifier: HostKeyVerifier?
 
     private var retryTasks: [UUID: Task<Void, Never>] = [:]
+    private var healthTasks: [UUID: Task<Void, Never>] = [:]
     private var sessionCancellables: [UUID: AnyCancellable] = [:]
+    /// Suppresses terminationHandler while we intentionally stop rclone.
+    private var intentionalStops: Set<UUID> = []
+    /// Consecutive health-poll failures per remote before declaring death.
+    private var healthFailStreak: [UUID: Int] = [:]
+
+    private static let healthPollIntervalSeconds: UInt64 = 20
+    private static let healthFailThreshold = 2
 
     public init(
         store: RemoteStore,
@@ -63,6 +71,7 @@ public final class SessionManager: ObservableObject {
             mounter.reconcileStaleMount(volumeName: volname)
         }
         for session in sessions where session.remote.autoMount {
+            session.wantsMounted = true
             scheduleMount(remoteID: session.id, attempt: 0)
         }
     }
@@ -71,15 +80,23 @@ public final class SessionManager: ObservableObject {
         retryTasks[remoteID]?.cancel()
         retryTasks[remoteID] = Task { @MainActor [weak self] in
             guard let self else { return }
+            guard let session = self.sessions.first(where: { $0.id == remoteID }) else { return }
+            guard session.wantsMounted else { return }
+            if attempt > 0 {
+                session.transition(to: .reconnecting(attempt: attempt, reason: "retrying mount"))
+            }
             do {
-                try self.mount(remoteID: remoteID)
+                // cancelRetries: false so this task is not cancelled by mount() itself.
+                try await self.mount(remoteID: remoteID, cancelRetries: false)
                 self.retryTasks[remoteID] = nil
             } catch {
+                guard session.wantsMounted, !Task.isCancelled else { return }
                 let nextAttempt = attempt + 1
                 let delay = Self.backoffDelay(attempt: nextAttempt)
                 guard delay > 0 else { return }
+                session.transition(to: .reconnecting(attempt: nextAttempt, reason: String(describing: error)))
                 try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-                if !Task.isCancelled {
+                if !Task.isCancelled, session.wantsMounted {
                     self.scheduleMount(remoteID: remoteID, attempt: nextAttempt)
                 }
             }
@@ -87,7 +104,7 @@ public final class SessionManager: ObservableObject {
     }
 
     /// Exponential backoff: 1s, 5s, 30s, then 5min cap.
-    static func backoffDelay(attempt: Int) -> TimeInterval {
+    nonisolated public static func backoffDelay(attempt: Int) -> TimeInterval {
         switch attempt {
         case 1: return 1
         case 2: return 5
@@ -153,8 +170,13 @@ public final class SessionManager: ObservableObject {
     public func delete(_ remoteID: UUID) throws {
         retryTasks[remoteID]?.cancel()
         retryTasks[remoteID] = nil
-        if let session = sessions.first(where: { $0.id == remoteID }), case .mounted = session.status {
-            try? unmount(remoteID: remoteID)
+        if let session = sessions.first(where: { $0.id == remoteID }) {
+            switch session.status {
+            case .mounted, .starting, .reconnecting:
+                try? unmount(remoteID: remoteID)
+            default:
+                break
+            }
         }
         try? keychain.delete(remoteID: remoteID, kind: .password)
         try? keychain.delete(remoteID: remoteID, kind: .keyPassphrase)
@@ -166,12 +188,28 @@ public final class SessionManager: ObservableObject {
         try reload()
     }
 
-    public func mount(remoteID: UUID) throws {
+    /// Mount a remote. Prefer this async entry so callers can leave the main thread free.
+    /// - Parameter cancelRetries: When true (default, manual Mount), cancel any silent remount task first.
+    public func mount(remoteID: UUID, cancelRetries: Bool = true) async throws {
         guard let session = sessions.first(where: { $0.id == remoteID }) else { return }
+        // Cancel an in-flight silent retry so manual Mount is the sole owner.
+        if cancelRetries {
+            retryTasks[remoteID]?.cancel()
+            retryTasks[remoteID] = nil
+        }
+        stopHealthPoll(remoteID: remoteID)
+
+        if case .mounted = session.status {
+            return
+        }
+
+        session.wantsMounted = true
         session.transition(to: .starting)
 
         let remote = session.remote
         var ephemeralKeyURL: URL? = nil
+        var spawnedProcess: Process? = nil
+        var configDirURL: URL? = nil
         var envOverrides: [String: String] = [:]
         var bundle = BackendSecrets()
         var remotePath: String
@@ -195,14 +233,19 @@ public final class SessionManager: ObservableObject {
                         resolvedKeyPath = url.path
                     }
                 }
+                let keyPassphrase = try keychain.get(remoteID: remote.id, kind: .keyPassphrase)
                 bundle.sftp = SFTPSecrets(
                     password: password,
                     privateKeyPath: resolvedKeyPath,
-                    keyPassphrase: try keychain.get(remoteID: remote.id, kind: .keyPassphrase)
+                    keyPassphrase: keyPassphrase
                 )
                 if sftp.authKind == .password, let p = password {
                     envOverrides[RcloneConfigBuilder.passwordEnvVar(remoteID: remote.id)] =
                         try RcloneProcess.obscure(plaintext: p, binary: rcloneBinary)
+                }
+                if let pp = keyPassphrase, !pp.isEmpty {
+                    envOverrides[RcloneConfigBuilder.keyFilePassEnvVar(remoteID: remote.id)] =
+                        try RcloneProcess.obscure(plaintext: pp, binary: rcloneBinary)
                 }
                 if let verifier = hostKeyVerifier {
                     try verifier.ensureKnown(host: sftp.host, port: sftp.port)
@@ -256,30 +299,59 @@ public final class SessionManager: ObservableObject {
                     envOverrides: envOverrides
                 )
             }
-            try waitForPort(spawned.port, timeout: 5.0)
+            spawnedProcess = spawned.process
+            configDirURL = spawned.configDirURL
 
-            let mountpoint: String
-            switch remote.mountProtocol {
-            case .webdav:
-                mountpoint = try mounter.mountWebDAV(
-                    host: "127.0.0.1",
-                    port: spawned.port,
-                    baseurl: "/\(volname)",
-                    user: spawned.user,
-                    password: spawned.password
-                )
-            case .nfs:
-                let mp = try mounter.resolveMountpoint(name: remote.name)
-                try mounter.mountNFS(host: "127.0.0.1", port: spawned.port, exportPath: "/", name: remote.name, mountpoint: mp)
-                mountpoint = mp
-            }
+            // Blocking port wait + NetFS off the main actor so the menu stays responsive.
+            let port = spawned.port
+            let user = spawned.user
+            let password = spawned.password
+            let mountProtocol = remote.mountProtocol
+            let remoteName = remote.name
+            let mountpoint: String = try await Task.detached(priority: .userInitiated) { [mounter] in
+                try Self.waitForPort(port, timeout: 5.0)
+                switch mountProtocol {
+                case .webdav:
+                    return try mounter.mountWebDAV(
+                        host: "127.0.0.1",
+                        port: port,
+                        baseurl: "/\(volname)",
+                        user: user,
+                        password: password
+                    )
+                case .nfs:
+                    let mp = try mounter.resolveMountpoint(name: remoteName)
+                    try mounter.mountNFS(host: "127.0.0.1", port: port, exportPath: "/", name: remoteName, mountpoint: mp)
+                    return mp
+                }
+            }.value
 
             session.rcloneProcess = spawned.process
             session.mountpoint = mountpoint
+            session.servePort = spawned.port
+            session.configDirURL = spawned.configDirURL
             session.ephemeralKeyURL = ephemeralKeyURL
+            session.wantsMounted = true
             session.transition(to: .mounted(at: mountpoint))
+
+            attachTerminationHandler(remoteID: remoteID, process: spawned.process)
+            startHealthPoll(remoteID: remoteID)
         } catch {
+            // P0-4: always kill rclone if spawn already succeeded.
+            if let proc = spawnedProcess, proc.isRunning {
+                intentionalStops.insert(remoteID)
+                proc.terminate()
+                intentionalStops.remove(remoteID)
+            }
+            if let dir = configDirURL {
+                try? FileManager.default.removeItem(at: dir)
+            }
             if let url = ephemeralKeyURL { try? FileManager.default.removeItem(at: url) }
+            session.rcloneProcess = nil
+            session.mountpoint = nil
+            session.servePort = nil
+            session.configDirURL = nil
+            session.ephemeralKeyURL = nil
             session.transition(to: .failed(reason: String(describing: error)))
             throw error
         }
@@ -287,29 +359,27 @@ public final class SessionManager: ObservableObject {
 
     public func unmount(remoteID: UUID) throws {
         guard let session = sessions.first(where: { $0.id == remoteID }) else { return }
+        session.wantsMounted = false
         retryTasks[remoteID]?.cancel()
         retryTasks[remoteID] = nil
-        if let mp = session.mountpoint {
-            try mounter.unmount(mountpoint: mp)
-        }
-        if let proc = session.rcloneProcess, proc.isRunning {
-            proc.terminate()
-        }
-        if let url = session.ephemeralKeyURL {
-            try? FileManager.default.removeItem(at: url)
-        }
-        session.rcloneProcess = nil
-        session.mountpoint = nil
-        session.ephemeralKeyURL = nil
+        stopHealthPoll(remoteID: remoteID)
+        healthFailStreak[remoteID] = nil
+
+        teardownBackend(session: session, unmountVolume: true)
         session.transition(to: .idle)
     }
 
     public func shutdownAll() {
         for (_, task) in retryTasks { task.cancel() }
         retryTasks.removeAll()
+        for id in healthTasks.keys { stopHealthPoll(remoteID: id) }
         for session in sessions {
-            if case .mounted = session.status {
+            session.wantsMounted = false
+            switch session.status {
+            case .mounted, .starting, .reconnecting:
                 try? unmount(remoteID: session.id)
+            default:
+                break
             }
         }
     }
@@ -318,24 +388,150 @@ public final class SessionManager: ObservableObject {
         logsDir.appendingPathComponent("\(remoteID.uuidString).log")
     }
 
-    private func waitForPort(_ port: Int, timeout: TimeInterval) throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            let sock = socket(AF_INET, SOCK_STREAM, 0)
-            if sock < 0 { Thread.sleep(forTimeInterval: 0.1); continue }
-            var addr = sockaddr_in()
-            addr.sin_family = sa_family_t(AF_INET)
-            addr.sin_port = UInt16(port).bigEndian
-            addr.sin_addr.s_addr = inet_addr("127.0.0.1")
-            let result = withUnsafePointer(to: &addr) { ptr -> Int32 in
-                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
-                    Darwin.connect(sock, sockPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+    // MARK: - Health + death recovery
+
+    private func attachTerminationHandler(remoteID: UUID, process: Process) {
+        process.terminationHandler = { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if self.intentionalStops.contains(remoteID) { return }
+                self.handleBackendDeath(remoteID: remoteID, reason: "rclone exited")
+            }
+        }
+    }
+
+    private func startHealthPoll(remoteID: UUID) {
+        stopHealthPoll(remoteID: remoteID)
+        healthFailStreak[remoteID] = 0
+        healthTasks[remoteID] = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: Self.healthPollIntervalSeconds * 1_000_000_000)
+                guard !Task.isCancelled, let self else { return }
+                guard let session = self.sessions.first(where: { $0.id == remoteID }) else { return }
+                guard case .mounted = session.status else { return }
+                if self.isHealthy(session) {
+                    self.healthFailStreak[remoteID] = 0
+                } else {
+                    let streak = (self.healthFailStreak[remoteID] ?? 0) + 1
+                    self.healthFailStreak[remoteID] = streak
+                    if streak >= Self.healthFailThreshold {
+                        self.handleBackendDeath(remoteID: remoteID, reason: "health check failed")
+                        return
+                    }
                 }
             }
-            close(sock)
-            if result == 0 { return }
+        }
+    }
+
+    private func stopHealthPoll(remoteID: UUID) {
+        healthTasks[remoteID]?.cancel()
+        healthTasks[remoteID] = nil
+    }
+
+    private func isHealthy(_ session: RemoteSession) -> Bool {
+        guard let proc = session.rcloneProcess, proc.isRunning else { return false }
+        guard let port = session.servePort else { return false }
+        if !Self.tcpConnects(host: "127.0.0.1", port: port) { return false }
+        if let mp = session.mountpoint {
+            // Volume must still be present; if Finder already ejected it, recover.
+            var isDir: ObjCBool = false
+            if !FileManager.default.fileExists(atPath: mp, isDirectory: &isDir) {
+                return false
+            }
+        }
+        return true
+    }
+
+    private func handleBackendDeath(remoteID: UUID, reason: String) {
+        guard let session = sessions.first(where: { $0.id == remoteID }) else { return }
+        // Ignore if already recovering or idle after user unmount.
+        switch session.status {
+        case .idle:
+            return
+        case .reconnecting:
+            // Already scheduling; still tear down leftovers once.
+            break
+        default:
+            break
+        }
+
+        stopHealthPoll(remoteID: remoteID)
+        healthFailStreak[remoteID] = nil
+        teardownBackend(session: session, unmountVolume: true)
+
+        if session.wantsMounted {
+            session.transition(to: .reconnecting(attempt: 0, reason: reason))
+            scheduleMount(remoteID: remoteID, attempt: 0)
+        } else {
+            session.transition(to: .failed(reason: reason))
+        }
+    }
+
+    private func teardownBackend(session: RemoteSession, unmountVolume: Bool) {
+        let id = session.id
+        if unmountVolume, let mp = session.mountpoint {
+            try? mounter.unmount(mountpoint: mp)
+        }
+        if let proc = session.rcloneProcess {
+            if proc.isRunning {
+                intentionalStops.insert(id)
+                proc.terminate()
+                intentionalStops.remove(id)
+            }
+            proc.terminationHandler = nil
+        }
+        if let dir = session.configDirURL {
+            try? FileManager.default.removeItem(at: dir)
+        }
+        if let url = session.ephemeralKeyURL {
+            try? FileManager.default.removeItem(at: url)
+        }
+        session.rcloneProcess = nil
+        session.mountpoint = nil
+        session.servePort = nil
+        session.configDirURL = nil
+        session.ephemeralKeyURL = nil
+    }
+
+    // MARK: - Networking helpers
+
+    nonisolated private static func waitForPort(_ port: Int, timeout: TimeInterval) throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if tcpConnects(host: "127.0.0.1", port: port) { return }
             Thread.sleep(forTimeInterval: 0.1)
         }
         throw NSError(domain: "macsh", code: 1, userInfo: [NSLocalizedDescriptionKey: "rclone serve did not open port \(port) within \(timeout)s"])
+    }
+
+    nonisolated private static func tcpConnects(host: String, port: Int) -> Bool {
+        let sock = socket(AF_INET, SOCK_STREAM, 0)
+        if sock < 0 { return false }
+        defer { close(sock) }
+
+        // Non-blocking connect with short timeout so health checks don't hang.
+        let flags = fcntl(sock, F_GETFL, 0)
+        _ = fcntl(sock, F_SETFL, flags | O_NONBLOCK)
+
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = UInt16(port).bigEndian
+        addr.sin_addr.s_addr = inet_addr(host)
+
+        let result = withUnsafePointer(to: &addr) { ptr -> Int32 in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                Darwin.connect(sock, sockPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        if result == 0 { return true }
+        if errno != EINPROGRESS { return false }
+
+        var pfd = pollfd(fd: sock, events: Int16(POLLOUT), revents: 0)
+        let pr = poll(&pfd, 1, 500)
+        guard pr > 0 else { return false }
+        var soError: Int32 = 0
+        var len = socklen_t(MemoryLayout<Int32>.size)
+        getsockopt(sock, SOL_SOCKET, SO_ERROR, &soError, &len)
+        return soError == 0
     }
 }
